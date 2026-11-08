@@ -1,0 +1,21 @@
+# data and caches (large, and can be rebuilt)
+cache/
+Mainz_2022-10_AXO-Optics-Scan-forML/
+*.cbf
+*.npy
+
+# model checkpoints (70-200 MB each)
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
