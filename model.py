@@ -28,3 +28,6 @@ class FCNet(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+class CNN(nn.Module):
+    pass
