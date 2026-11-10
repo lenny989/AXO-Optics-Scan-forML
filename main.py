@@ -14,11 +14,13 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 
-from data import make_loaders
-from model import ACTIVATIONS, FCNet
+from data import XrdDataset, make_loaders
+from model import ACTIVATIONS, CNN, FCNet
 
 LOSSES = {"huber": nn.SmoothL1Loss, "mse": nn.MSELoss, "l1": nn.L1Loss}
 
@@ -28,11 +30,19 @@ def get_args():
     # data
     p.add_argument("--cache", required=True, help="cache prefix, e.g. cache/xrd")
     p.add_argument("--val-scans", nargs="+", required=True, help="run names held out for validation")
+    p.add_argument("--exclude-scans", nargs="+", default=[],
+                   help="drop every run whose name contains one of these texts, e.g. 236cm")
     p.add_argument("--no-augment", action="store_true", help="turn shift augmentation off")
     p.add_argument("--signal-frac", type=float, default=0.3, help="threshold that finds the signal")
     p.add_argument("--repeat", type=int, default=5, help="passes over the images per epoch")
     # model
-    p.add_argument("--hidden", nargs="+", type=int, default=[1024, 512, 128])
+    p.add_argument("--model", choices=["fc", "cnn"], default="fc")
+    p.add_argument("--hidden", nargs="+", type=int, default=[1024, 512, 128], help="fc: hidden layers")
+    p.add_argument("--channels", nargs="+", type=int, default=[16, 32, 64, 128],
+                   help="cnn: output channels of the conv blocks (each block halves the image)")
+    p.add_argument("--head", nargs="+", type=int, default=[256], help="cnn: fully connected layers after the convs")
+    p.add_argument("--pool", choices=["flatten", "avg"], default="flatten",
+                   help="cnn: flatten keeps positions, avg averages them away")
     p.add_argument("--activation", choices=ACTIVATIONS, default="relu")
     p.add_argument("--dropout", type=float, default=0.2)
     p.add_argument("--no-batchnorm", action="store_true")
@@ -82,6 +92,23 @@ def evaluate(model, loader, y_std, device, max_batches=0):
     return (err / n) * y_std
 
 
+@torch.no_grad()
+def predict(model, loader, device, max_batches=0):
+    """Predictions and targets (both standardized) in loader order. Evaluation mode: no dropout."""
+    model.eval()
+    preds, trues = [], []
+    for i, (x, y) in enumerate(loader):
+        if max_batches and i >= max_batches:
+            break
+        preds.append(model(x.to(device)).cpu())
+        trues.append(y)
+    return torch.cat(preds), torch.cat(trues)
+
+
+LOG_FIELDS = ["epoch", "train_loss", "val_loss", "val_mae_dx", "val_mae_dz",
+              "train_mae_dx", "train_mae_dz", "lr", "seconds"]
+
+
 def main():
     a = get_args()
     if a.resume and not a.name:
@@ -96,10 +123,22 @@ def main():
 
     train_dl, val_dl, stats = make_loaders(
         a.cache, a.val_scans, a.batch_size, a.repeat, a.workers,
-        augment=not a.no_augment, signal_frac=a.signal_frac)
+        augment=not a.no_augment, signal_frac=a.signal_frac, exclude=a.exclude_scans)
     y_std = torch.tensor(stats["y_std"], dtype=torch.float32)
     if len(train_dl) == 0:
         raise SystemExit("fewer training samples than one batch: lower --batch-size or raise --repeat")
+
+    # For the extra metrics: which run each validation image belongs to, its real targets, and a fixed
+    # subset of training images that is evaluated WITHOUT augmentation (train MAE comparable to val MAE).
+    val_ds, tr_ds = val_dl.dataset, train_dl.dataset
+    val_run = np.load(f"{a.cache}_scans.npy")[val_ds.idx].astype(str)
+    val_true_real = np.asarray(val_ds.targets)[val_ds.idx]
+    y_mean = np.asarray(stats["y_mean"])
+    sub = np.sort(np.random.default_rng(0).choice(tr_ds.idx, size=min(5000, len(tr_ds.idx)), replace=False))
+    chk_workers = min(2, a.workers)
+    chk_dl = DataLoader(XrdDataset(tr_ds.images_path, tr_ds.targets, sub, tr_ds.s, augment=False),
+                        batch_size=a.batch_size * 2, num_workers=chk_workers,
+                        persistent_workers=chk_workers > 0)
 
     # Baseline: always predict the training mean (= 0 after standardizing).
     base = torch.zeros(2)
@@ -107,8 +146,13 @@ def main():
         base += y.abs().sum(0)
     base = base / len(val_dl.dataset) * y_std
 
-    model = FCNet(hidden=tuple(a.hidden), p_drop=a.dropout, activation=a.activation,
-                  batchnorm=not a.no_batchnorm).to(device)
+    in_shape = tuple(train_dl.dataset[0][0].shape)           # (1, 128, 128), (1, 256, 256), ... from the cache
+    if a.model == "cnn":
+        model = CNN(in_shape=in_shape, channels=tuple(a.channels), head=tuple(a.head), p_drop=a.dropout,
+                    activation=a.activation, batchnorm=not a.no_batchnorm, pool=a.pool).to(device)
+    else:
+        model = FCNet(in_dim=int(np.prod(in_shape)), hidden=tuple(a.hidden), p_drop=a.dropout,
+                      activation=a.activation, batchnorm=not a.no_batchnorm).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"run={a.name}  device={device}  params={n_params / 1e6:.1f}M  "
           f"train batches/epoch={len(train_dl)}  val samples={len(val_dl.dataset)}")
@@ -135,10 +179,21 @@ def main():
         print(f"resumed at epoch {start}")
 
     fresh = start == 0
-    log = open(out / "log.csv", "w" if fresh else "a", newline="")
-    writer = csv.writer(log)
-    if fresh:
-        writer.writerow(["epoch", "train_loss", "val_mae_dx", "val_mae_dz", "lr", "seconds"])
+    log_file = out / "log.csv"
+    need_header = fresh or not log_file.exists() or log_file.stat().st_size == 0
+    # A resumed run keeps the columns its log already has (a run started with an older version of
+    # this script simply gets no new columns), so the CSV never ends up with ragged rows.
+    fields = LOG_FIELDS if need_header else log_file.read_text().splitlines()[0].split(",")
+    log = open(log_file, "w" if need_header else "a", newline="")
+    writer = csv.DictWriter(log, fieldnames=fields, extrasaction="ignore")
+    if need_header:
+        writer.writeheader()
+    scan_file = out / "per_scan.csv"          # validation MAE of every held-out run, every epoch
+    scan_new = fresh or not scan_file.exists()
+    scan_log = open(scan_file, "w" if scan_new else "a", newline="")
+    scan_writer = csv.writer(scan_log)
+    if scan_new:
+        scan_writer.writerow(["epoch", "scan", "n", "mae_dx", "mae_dz"])
 
     for epoch in range(start, a.epochs):
         t0 = time.time()
@@ -160,15 +215,44 @@ def main():
 
         val = evaluate(model, val_dl, y_std, device, a.max_batches)
         mean_val = val.mean().item()
-        writer.writerow([epoch, total / nb, val[0].item(), val[1].item(),
-                         lr_now, round(time.time() - t0, 1)])
+
+        # Extra metrics. They are optional: if something in here fails, training carries on without them.
+        nan = float("nan")
+        val_loss, tr_mae, preds = nan, torch.full((2,), nan), None
+        try:
+            pv, tv = predict(model, val_dl, device, a.max_batches)
+            val_loss = loss_fn(pv, tv).item()
+            pt, tt = predict(model, chk_dl, device, a.max_batches)
+            tr_mae = (pt - tt).abs().mean(0) * y_std
+            runs = val_run[:len(pv)]
+            for s in np.unique(runs):
+                m = torch.from_numpy(runs == s)
+                e = (pv[m] - tv[m]).abs().mean(0) * y_std
+                scan_writer.writerow([epoch, s, int(m.sum()), e[0].item(), e[1].item()])
+            scan_log.flush()
+            preds = (pv.numpy() * y_std.numpy() + y_mean, runs)
+        except Exception as ex:
+            print(f"WARNING: extra metrics failed this epoch: {ex!r}")
+
+        writer.writerow(dict(epoch=epoch, train_loss=total / nb, val_loss=val_loss,
+                             val_mae_dx=val[0].item(), val_mae_dz=val[1].item(),
+                             train_mae_dx=tr_mae[0].item(), train_mae_dz=tr_mae[1].item(),
+                             lr=lr_now, seconds=round(time.time() - t0, 1)))
         log.flush()
-        print(f"epoch {epoch:3d}  loss {total / nb:.4f}  val MAE dx={val[0]:.4f} dz={val[1]:.4f}")
+        print(f"epoch {epoch:3d}  loss {total / nb:.4f}  val loss {val_loss:.4f}  "
+              f"val MAE dx={val[0]:.4f} dz={val[1]:.4f}  train MAE dx={tr_mae[0]:.4f} dz={tr_mae[1]:.4f}")
 
         if mean_val < best:
             best = mean_val
             torch.save(dict(model=model.state_dict(), stats=stats, epoch=epoch, config=cfg),
                        out / "best.pt")
+            if preds is not None:                 # predictions of the best model, real units
+                p, runs = preds
+                n = len(p)
+                pd.DataFrame(dict(scan=runs, index=val_ds.idx[:n],
+                                  true_dx=val_true_real[:n, 0], true_dz=val_true_real[:n, 1],
+                                  pred_dx=p[:, 0], pred_dz=p[:, 1], epoch=epoch)
+                             ).to_csv(out / "predictions.csv", index=False)
             summary.update(best_val_mean=mean_val, best_val_dx=val[0].item(),
                            best_val_dz=val[1].item(), best_epoch=epoch)
         summary.update(last_epoch=epoch, last_train_loss=total / nb,

@@ -9,6 +9,7 @@ Labels come straight from the xlab log files:
   target = (hexapod x, hexapod z) read from the log with the same number.
   scan   = the run folder name (used for the train/val split).
 """
+import os
 import re
 from pathlib import Path
 
@@ -80,13 +81,20 @@ def build_cache(data_root, out_prefix, out_size=128):
     first = fabio.open(df.file.iloc[0]).data
     keep_rows, keep_cols = find_keep_masks(first)
 
-    imgs = np.zeros((len(df), out_size, out_size), dtype=np.float16)
+    # Write straight into the .npy file on disk (memory-mapped) instead of holding all images in RAM:
+    # 256x256 would need about 8 GB of RAM otherwise. The file gets its real name only when complete,
+    # so a job that dies halfway never leaves a half-filled cache behind.
+    final = f"{out_prefix}_images.npy"
+    part = final + ".part"
+    imgs = np.lib.format.open_memmap(part, mode="w+", dtype=np.float16,
+                                     shape=(len(df), out_size, out_size))
     for i, f in enumerate(df.file):
         imgs[i] = preprocess(fabio.open(f).data, keep_rows, keep_cols, out_size)
         if i % 5000 == 0:
-            print(f"{i}/{len(df)}")
-
-    np.save(f"{out_prefix}_images.npy", imgs)
+            print(f"{i}/{len(df)}", flush=True)
+    imgs.flush()
+    del imgs
+    os.replace(part, final)
     np.save(f"{out_prefix}_targets.npy", df[["dx", "dz"]].to_numpy(np.float32))
     np.save(f"{out_prefix}_scans.npy", df.scan.to_numpy().astype(str))  # plain string array, no pickle
 
@@ -169,19 +177,32 @@ class XrdDataset(Dataset):
 
 
 def make_loaders(prefix, val_scans, batch_size=256, repeat=5, num_workers=4,
-                 augment=True, signal_frac=0.3):
+                 augment=True, signal_frac=0.3, exclude=()):
     images_path = f"{prefix}_images.npy"
     images = np.load(images_path, mmap_mode="r")      # used here only for the statistics
     targets = np.load(f"{prefix}_targets.npy")
     scans = np.load(f"{prefix}_scans.npy")
 
-    known = set(np.unique(scans))
+    # Runs whose name contains any `exclude` pattern are dropped completely
+    # (not in training, not in validation, not in the statistics).
+    keep = np.ones(len(scans), dtype=bool)
+    all_runs = sorted(str(s) for s in np.unique(scans))
+    if exclude:
+        for pat in exclude:
+            if not any(pat in s for s in all_runs):
+                raise ValueError(f"--exclude-scans pattern {pat!r} matches no run. Runs: {all_runs}")
+        dropped = [s for s in all_runs if any(pat in s for pat in exclude)]
+        keep = ~np.isin(scans, dropped)
+        print(f"excluding {len(dropped)} run(s) with {(~keep).sum()} images: {dropped}")
+
+    known = set(np.unique(scans[keep]))
     unknown = [s for s in val_scans if s not in known]
     if unknown:
-        raise ValueError(f"unknown val scan(s) {unknown}. Valid names: {sorted(known)}")
+        raise ValueError(f"unknown val scan(s) {unknown} (or excluded). Valid names: {sorted(known)}")
     if known <= set(val_scans):
         raise ValueError("all runs are in --val-scans; nothing left for training")
     tr, va = split_by_scan(scans, val_scans)
+    tr, va = tr[keep[tr]], va[keep[va]]
     stats = compute_stats(images, targets, tr)
 
     train_ds = XrdDataset(images_path, targets, tr, stats, augment=augment, repeat=repeat,
