@@ -1,0 +1,34 @@
+{
+  "cache": "cache/xrd_128",
+  "val_scans": [
+    "Mainz_20220912_02_AXO-Optics-Scan-forML_245W_Al-tape_noFlTu_SourceDet-130cm_detPos1",
+    "Mainz_20220914_01_AXO-Optics-Scan-forML_245W_Al-tape_noFlTu_SourceDet-160cm_detPos1"
+  ],
+  "no_augment": false,
+  "signal_frac": 0.3,
+  "repeat": 5,
+  "hidden": [
+    1024,
+    512,
+    128
+  ],
+  "activation": "relu",
+  "dropout": 0.2,
+  "no_batchnorm": false,
+  "loss": "huber",
+  "optimizer": "adamw",
+  "lr": 0.001,
+  "weight_decay": 0.01,
+  "scheduler": "cosine",
+  "epochs": 100,
+  "batch_size": 256,
+  "seed": 0,
+  "name": "exp_wd1e-2",
+  "runs_dir": "runs",
+  "workers": 7,
+  "resume": false,
+  "max_batches": 0,
+  "n_params": 17372290,
+  "baseline_dx": 0.2524852752685547,
+  "baseline_dz": 0.2524765729904175
+}
