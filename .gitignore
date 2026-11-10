@@ -7,6 +7,14 @@ Mainz_2022-10_AXO-Optics-Scan-forML/
 # model checkpoints (70-200 MB each)
 *.pt
 
+#comparison output
+runs/comparison.csv
+runs/comparison.png
+runs/plots/
+
+#server side
+logs/
+
 # Python
 __pycache__/
 *.pyc
