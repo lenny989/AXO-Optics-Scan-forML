@@ -56,6 +56,16 @@ SEEDS = {
     "dropout 0 + wide": ["exp_do0_wide", "exp_do0_wide_s1", "exp_do0_wide_s2"],
 }
 
+# Resolution test (FC network, dropout 0). Resolution -> runs.
+# "same": identical hidden layers 1024-512-128 (so the first layer grows with the pixel count).
+# "matched": first layer about 17M weights, like the default at 128x128.
+RES_SAME = {64: ["res64_do0_s0", "res64_do0_s1"],
+            128: ["exp_do0", "exp_do0_s1", "exp_do0_s2"],
+            256: ["res256_do0_s0", "res256_do0_s1"]}
+RES_MATCHED = {64: ["res64_do0_wide_s0"],          # --hidden 4096 512 128
+               256: ["res256_do0_narrow_s0"]}      # --hidden 256 512 128
+RES_OTHER = {64: [("512-256-128", "res64_do0_narrow_s0")]}
+
 FOOT = ("Validation MAE = mean of dx and dz on the two held-out runs. "
         "Dots: mean of the last 10 epochs, bars: standard deviation over those epochs.")
 
@@ -164,6 +174,103 @@ def seed_figure(runs_dir, out_dir, rows):
     plt.close(fig)
 
 
+def resolution_figure(runs_dir, out_dir, rows):
+    name = "9_resolution"
+    print(name)
+    fig, (ax, axc) = plt.subplots(1, 2, figsize=(13, 5.2), gridspec_kw={"width_ratios": [1, 1.4]})
+    xs = {64: 0, 128: 1, 256: 2}
+
+    def last10_of(runs, label, res):
+        out = []
+        for run in runs:
+            d = load(runs_dir, run)
+            if d is None:
+                print(f"  missing: {run}  ({label}, {res}x{res})")
+                continue
+            m, s = last10(d)
+            out.append(m)
+            rows.append(dict(group=name, panel="resolution", label=f"{label} @{res}", run=run,
+                             epochs=len(d), last10_mean=m, last10_std=s, best_epoch_value=d.mae.min()))
+        return out
+
+    same = {}
+    for res, runs in RES_SAME.items():
+        v = last10_of(runs, "same widths", res)
+        if v:
+            ax.scatter(xs[res] + np.linspace(-0.08, 0.08, len(v)), v, s=40, color="C0", zorder=3)
+            ax.hlines(np.mean(v), xs[res] - 0.2, xs[res] + 0.2, color="C0", lw=2)
+            ax.annotate(f"{np.mean(v):.4f}", (xs[res] + 0.2, np.mean(v)), xytext=(4, 2),
+                        textcoords="offset points", fontsize=8, color="C0")
+            same[res] = float(np.mean(v))
+    if len(same) > 1:
+        ax.plot([xs[r] for r in sorted(same)], [same[r] for r in sorted(same)],
+                color="C0", lw=1, alpha=0.5, label="same hidden layers (1024-512-128)")
+    elif same:
+        ax.scatter([], [], color="C0", label="same hidden layers (1024-512-128)")
+
+    matched = {}
+    for res, runs in RES_MATCHED.items():
+        v = last10_of(runs, "matched", res)
+        if v:
+            matched[res] = float(np.mean(v))
+    if 128 in same:
+        matched[128] = same[128]          # the default at 128 is the reference for the matched first layer
+    if matched:
+        order = sorted(matched)
+        ax.plot([xs[r] for r in order], [matched[r] for r in order], "s--", color="C1", ms=7,
+                label="first layer about 17M weights (matched)")
+        for r in order:
+            if r != 128:
+                ax.annotate(f"{matched[r]:.4f}", (xs[r], matched[r]), xytext=(6, -10),
+                            textcoords="offset points", fontsize=8, color="C1")
+
+    for res, items in RES_OTHER.items():
+        for label, run in items:
+            v = last10_of([run], label, res)
+            if v:
+                ax.scatter([xs[res]], v, marker="x", color="gray", s=50, zorder=3)
+                ax.annotate(label, (xs[res], v[0]), xytext=(6, 4), textcoords="offset points",
+                            fontsize=8, color="gray")
+
+    ax.set_xticks(list(xs.values()))
+    ax.set_xticklabels([f"{r}x{r}" for r in xs])
+    ax.set_xlim(-0.5, 2.6)
+    ax.set_ylabel("last-10-epoch validation MAE")
+    ax.set_title("Final level by resolution (dot = seed, bar = mean)")
+    ax.grid(alpha=0.3, axis="y")
+    ax.margins(y=0.15)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8, loc="best")
+
+    # curves of seed 0 for each resolution
+    colors = {64: "C2", 128: "C0", 256: "C3"}
+    for res, runs in RES_SAME.items():
+        d = load(runs_dir, runs[0])
+        if d is not None:
+            axc.plot(d.epoch, d.mae, color=colors[res], alpha=0.2, lw=0.8)
+            axc.plot(d.epoch, d.mae.rolling(5, min_periods=1, center=True).mean(), color=colors[res],
+                     lw=2, label=f"{res}x{res} same widths")
+    for res, runs in RES_MATCHED.items():
+        d = load(runs_dir, runs[0])
+        if d is not None:
+            axc.plot(d.epoch, d.mae.rolling(5, min_periods=1, center=True).mean(), color=colors[res],
+                     lw=2, ls="--", label=f"{res}x{res} matched first layer")
+    axc.set_yscale("log")
+    axc.set_xlabel("epoch")
+    axc.set_ylabel("validation MAE")
+    axc.set_title("Curves (seed 0)")
+    axc.grid(alpha=0.3, which="both")
+    if axc.get_legend_handles_labels()[0]:
+        axc.legend(fontsize=8, loc="upper right")
+
+    fig.suptitle("Resolution (FC network, dropout 0)", fontsize=14, fontweight="bold")
+    fig.text(0.01, 0.005, "Same hidden layers: the first layer grows with the pixel count (4M / 17M / 67M weights). "
+                         "Matched: first layer about 17M weights at every resolution.", fontsize=8, color="gray")
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.savefig(out_dir / f"{name}.png", dpi=150)
+    plt.close(fig)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--runs-dir", default="runs")
@@ -176,6 +283,7 @@ def main():
     for name, (title, panels) in GROUPS.items():
         group_figure(name, title, panels, a.runs_dir, out, rows)
     seed_figure(a.runs_dir, out, rows)
+    resolution_figure(a.runs_dir, out, rows)
 
     if rows:
         df = pd.DataFrame(rows)
