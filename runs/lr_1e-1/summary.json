@@ -1,0 +1,9 @@
+{
+  "best_val_mean": 0.015424145385622978,
+  "best_val_dx": 0.013647239655256271,
+  "best_val_dz": 0.017201051115989685,
+  "best_epoch": 57,
+  "last_epoch": 99,
+  "last_train_loss": 0.021860662758613113,
+  "baseline_mean": 0.2524809241294861
+}
